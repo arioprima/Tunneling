@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:dartssh2/dartssh2.dart';
-
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'login_tab.dart';
 import 'terminal_tab.dart';
 import 'sftp_tab.dart';
@@ -486,11 +486,17 @@ class _SSHClientWindowState extends State<SSHClientWindow>
       icon: Icons.folder_outlined,
       title: 'New SFTP Window',
       color: Colors.orange,
-      onTap: () {
-        _tabController.animateTo(4);
-        _addLogMessage('New SFTP window opened');
-      },
+      onTap: _openNewSftpWindow, // ⬅️ ganti ke fungsi baru ini
     ),
+    // _SidebarItem(
+    //   icon: Icons.folder_outlined,
+    //   title: 'New SFTP Window',
+    //   color: Colors.orange,
+    //   onTap: () {
+    //     _tabController.animateTo(4);
+    //     _addLogMessage('New SFTP window opened');
+    //   },
+    // ),
     _SidebarItem(
       icon: Icons.desktop_windows_outlined,
       title: 'New Remote Desktop',
@@ -660,6 +666,51 @@ class _SSHClientWindowState extends State<SSHClientWindow>
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text('Reset Profile (UI only) – coming soon')),
     );
+  }
+
+  Future<void> _openNewSftpWindow() async {
+    // Ambil data login dari LoginTab
+    final data = _loginKey.currentState?.readCredentials();
+    if (data == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Lengkapi form Login dulu')));
+      _tabController.animateTo(0);
+      return;
+    }
+
+    // Susun profile yang akan dikirim ke sub-window
+    final profile = SSHProfile(
+      name: (data['profileName'] as String?)?.trim().isNotEmpty == true
+          ? data['profileName'] as String
+          : '${data['username']}@${data['host']}',
+      host: data['host'] as String,
+      port: data['port'] as int,
+      username: data['username'] as String,
+      method: (data['method'] as String?) ?? 'password',
+      password: (data['password'] as String?)?.isNotEmpty == true
+          ? data['password'] as String
+          : null,
+      privateKeyPath: data['privateKeyPath'] as String?,
+    );
+
+    final args = jsonEncode({'kind': 'sftp', 'profile': profile.toJson()});
+
+    try {
+      final window = await DesktopMultiWindow.createWindow(args);
+      await window.setTitle('SFTP - ${profile.host}');
+      await window.center();
+      await window.show();
+      _addLogMessage('New SFTP window opened');
+    } catch (e) {
+      debugPrint('❌ Gagal buka SFTP Window: $e');
+      _addLogMessage('❌ Gagal buka SFTP Window: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Gagal buka SFTP Window: $e')));
+    }
   }
 
   /// ————————————————————————————————————————————————————————————————

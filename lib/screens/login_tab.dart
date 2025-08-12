@@ -55,7 +55,7 @@ class LoginTabState extends State<LoginTab> {
 
   void applyProfile(Map<String, dynamic> p) {
     // helper untuk baca nested key "kerberos"
-    Map<String, dynamic> _kerb(Map<String, dynamic> src) =>
+    Map<String, dynamic> kerb(Map<String, dynamic> src) =>
         (src['kerberos'] is Map<String, dynamic>)
         ? (src['kerberos'] as Map<String, dynamic>)
         : const {};
@@ -80,7 +80,7 @@ class LoginTabState extends State<LoginTab> {
       }
 
       // kerberos
-      final k = _kerb(p);
+      final k = kerb(p);
       _spnController.text = (k['spn'] ?? '') as String;
       _gssKerberos = (k['gssKerberos'] as bool?) ?? false;
       _requestDelegation = (k['requestDelegation'] as bool?) ?? false;
