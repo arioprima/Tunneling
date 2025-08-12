@@ -1,7 +1,12 @@
+// sftp_tab.dart
 import 'package:flutter/material.dart';
+import 'package:dartssh2/dartssh2.dart';
 
 class SFTPScreen extends StatelessWidget {
-  final List<Map<String, dynamic>> files = [
+  final SSHClient client; // diterima dari parent (belum dipakai di UI dummy)
+  const SFTPScreen({super.key, required this.client});
+
+  static const List<Map<String, String>> files = [
     {
       'name': 'Documents',
       'type': 'folder',
@@ -34,41 +39,66 @@ class SFTPScreen extends StatelessWidget {
     },
   ];
 
-  const SFTPScreen({super.key});
-
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
         Padding(
-          padding: EdgeInsets.all(8),
+          padding: const EdgeInsets.all(8),
           child: Row(
             children: [
-              IconButton(icon: Icon(Icons.refresh), onPressed: () {}),
-              IconButton(icon: Icon(Icons.arrow_upward), onPressed: () {}),
-              IconButton(icon: Icon(Icons.download), onPressed: () {}),
-              IconButton(icon: Icon(Icons.create_new_folder), onPressed: () {}),
-              IconButton(icon: Icon(Icons.delete), onPressed: () {}),
-              Spacer(),
-              Text('Remote path: /home/user'),
+              IconButton(
+                icon: const Icon(Icons.refresh),
+                onPressed: () {
+                  /* nanti implement real refresh */
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.arrow_upward),
+                onPressed: () {
+                  /* cd .. */
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.download),
+                onPressed: () {
+                  /* download */
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.create_new_folder),
+                onPressed: () {
+                  /* mkdir */
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.delete),
+                onPressed: () {
+                  /* delete */
+                },
+              ),
+              const Spacer(),
+              const Text('Remote path: /home/user'),
             ],
           ),
         ),
+        const Divider(height: 0),
         Expanded(
           child: ListView.builder(
             itemCount: files.length,
             itemBuilder: (context, index) {
               final item = files[index];
+              final isFolder = item['type'] == 'folder';
               return ListTile(
                 leading: Icon(
-                  item['type'] == 'folder'
-                      ? Icons.folder
-                      : Icons.insert_drive_file,
+                  isFolder ? Icons.folder : Icons.insert_drive_file,
                 ),
-                title: Text(item['name']),
+                title: Text(item['name'] ?? ''),
                 subtitle: Text('${item['size']} • ${item['modified']}'),
-                trailing: Icon(Icons.more_vert),
-                onTap: () {},
+                trailing: const Icon(Icons.more_vert),
+                onTap: () {
+                  // nanti: kalau folder -> cd ke folder tsb, kalau file -> preview/aksi lain
+                },
               );
             },
           ),
