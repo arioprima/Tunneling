@@ -314,6 +314,20 @@ class _SftpWindowState extends State<SftpWindow> {
     }, 'Mkdir "$name"');
   }
 
+  Future<void> _remoteRename(_FileItem item) async {
+    final newName = await _prompt('Rename to', initial: item.name);
+    if (newName == null || newName.trim().isEmpty || newName == item.name) {
+      return;
+    }
+    final newPath = p.posix.normalize(
+      p.posix.join(_remotePath, newName.trim()),
+    );
+    await _guard(() async {
+      await _sftp!.rename(item.path, newPath);
+      await _loadRemote();
+    }, 'Rename "${item.name}"');
+  }
+
   // ------------------- LOCAL ACTIONS -------------------
   Future<void> _localMkdir() async {
     final name = await _prompt('New folder name');
@@ -323,6 +337,19 @@ class _SftpWindowState extends State<SftpWindow> {
       await Directory(path).create(recursive: true);
       await _loadLocal();
     }, 'Mkdir "$name"');
+  }
+
+  Future<void> _localRename(_FileItem item) async {
+    final newName = await _prompt('Rename to', initial: item.name);
+    if (newName == null || newName.trim().isEmpty || newName == item.name) {
+      return;
+    }
+    final newPath = p.normalize(p.join(_localPath, newName.trim()));
+    await _guard(() async {
+      final entity = item.isDir ? Directory(item.path) : File(item.path);
+      await entity.rename(newPath);
+      await _loadLocal();
+    }, 'Rename "${item.name}"');
   }
 
   // ------------------- TRANSFERS (COPY, bukan move) -------------------
@@ -958,6 +985,8 @@ class _SftpWindowState extends State<SftpWindow> {
                               selectedSet: _selLocal,
                               onSelect: (i) => _selectLocal(i),
                               onDoubleTap: (f) => _doubleClickLocal(f),
+                              onNewFolder: _localMkdir,
+                              onRename: (f) => _localRename(f),
                             ),
                           ),
                         ],
@@ -1086,6 +1115,8 @@ class _SftpWindowState extends State<SftpWindow> {
                               selectedSet: _selRemote,
                               onSelect: (i) => _selectRemote(i),
                               onDoubleTap: (f) => _doubleClickRemote(f),
+                              onNewFolder: _remoteMkdir,
+                              onRename: (f) => _remoteRename(f),
                             ),
                           ),
                         ],
@@ -1214,12 +1245,41 @@ class _SftpWindowState extends State<SftpWindow> {
     );
   }
 
+  Future<void> _showFileContextMenu(
+    Offset position,
+    _FileItem item, {
+    required Future<void> Function() onNewFolder,
+    required Future<void> Function(_FileItem) onRename,
+  }) async {
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(
+        position.dx,
+        position.dy,
+        position.dx,
+        position.dy,
+      ),
+      items: [
+        const PopupMenuItem(value: 'mkdir', child: Text('New Folder')),
+        if (!item.isUp)
+          const PopupMenuItem(value: 'rename', child: Text('Rename')),
+      ],
+    );
+    if (result == 'mkdir') {
+      await onNewFolder();
+    } else if (result == 'rename') {
+      await onRename(item);
+    }
+  }
+
   Widget _fileList({
     required List<_FileItem> files,
     required int? selectedIndex,
     required Set<int> selectedSet,
     required void Function(int) onSelect,
     required void Function(_FileItem) onDoubleTap,
+    required Future<void> Function() onNewFolder,
+    required Future<void> Function(_FileItem) onRename,
   }) {
     return Column(
       children: [
@@ -1270,60 +1330,70 @@ class _SftpWindowState extends State<SftpWindow> {
               final f = files[i];
               final selected = selectedSet.contains(i);
               final isCurrent = selectedIndex == i;
-
-              return InkWell(
-                onTap: () => onSelect(i),
-                onDoubleTap: () => onDoubleTap(f),
-                child: Container(
-                  height: 22,
-                  color: selected
-                      ? Colors.blue.withOpacity(0.15)
-                      : (isCurrent
+              return GestureDetector(
+                onSecondaryTapDown: (d) {
+                  onSelect(i);
+                  _showFileContextMenu(
+                    d.globalPosition,
+                    f,
+                    onNewFolder: onNewFolder,
+                    onRename: onRename,
+                  );
+                },
+                child: InkWell(
+                  onTap: () => onSelect(i),
+                  onDoubleTap: () => onDoubleTap(f),
+                  child: Container(
+                    height: 22,
+                    color: selected
+                        ? Colors.blue.withOpacity(0.15)
+                        : (isCurrent
                             ? Colors.blue.withOpacity(0.08)
                             : (i % 2 == 0 ? Colors.grey[50] : Colors.white)),
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: Row(
-                    children: [
-                      Icon(
-                        f.isUp
-                            ? Icons.arrow_upward
-                            : (f.isDir
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Row(
+                      children: [
+                        Icon(
+                          f.isUp
+                              ? Icons.arrow_upward
+                              : (f.isDir
                                   ? Icons.folder
                                   : Icons.insert_drive_file),
-                        size: 14,
-                        color: f.isDir ? Colors.orange[600] : Colors.grey[600],
-                      ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        flex: 3,
-                        child: Text(
-                          f.name,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 11),
+                          size: 14,
+                          color: f.isDir ? Colors.orange[600] : Colors.grey[600],
                         ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.isDir ? '' : _fmtSize(f.size),
-                          style: const TextStyle(fontSize: 11),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          flex: 3,
+                          child: Text(
+                            f.name,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(fontSize: 11),
+                          ),
                         ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.isDir ? 'File folder' : 'File',
-                          style: const TextStyle(fontSize: 11),
+                        Expanded(
+                          flex: 1,
+                          child: Text(
+                            f.isDir ? '' : _fmtSize(f.size),
+                            style: const TextStyle(fontSize: 11),
+                          ),
                         ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.modified == null ? '' : _fmtTime(f.modified!),
-                          style: const TextStyle(fontSize: 11),
+                        Expanded(
+                          flex: 1,
+                          child: Text(
+                            f.isDir ? 'File folder' : 'File',
+                            style: const TextStyle(fontSize: 11),
+                          ),
                         ),
-                      ),
-                    ],
+                        Expanded(
+                          flex: 1,
+                          child: Text(
+                            f.modified == null ? '' : _fmtTime(f.modified!),
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               );
