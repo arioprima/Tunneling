@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=bitvise
+Exec=/usr/bin/bitvise
+Icon=bitvise
+Type=Application
+Terminal=false
+Categories=Utility;Development;

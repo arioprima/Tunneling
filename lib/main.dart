@@ -1,40 +1,32 @@
 import 'dart:convert';
+import 'dart:ui';
 import 'package:bitvise/screens/sftp_window_placeholder.dart';
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'screens/ssh_client_window.dart';
 
 void main(List<String> args) {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Jika proses ini diluncurkan sebagai sub-window (nanti oleh desktop_multi_window),
-  // ia akan membawa argumen "multi_window <windowId> <jsonArgs>".
   if (args.isNotEmpty && args.first == 'multi_window') {
-    final raw = (args.length > 2 && args[2].isNotEmpty) ? args[2] : '{}';
-    final Map<String, dynamic> data = jsonDecode(raw);
+    // 🟢 Registrasi plugin untuk engine tambahan (wajib di Linux)
+    DartPluginRegistrant.ensureInitialized();
 
-    final kind = data['kind'] as String? ?? 'sftp';
+    final int windowId = (args.length > 1) ? int.parse(args[1]) : 0;
+    final Map<String, dynamic> data = (args.length > 2 && args[2].isNotEmpty)
+        ? (jsonDecode(args[2]) as Map).cast<String, dynamic>()
+        : <String, dynamic>{};
 
-    if (kind == 'sftp') {
-      // Sementara: placeholder agar project tetap build.
-      // Di langkah berikutnya kita ganti dengan UI SFTP asli.
-      runApp(
-        SftpWindow(
-          profile: (data['profile'] as Map?)?.cast<String, dynamic>() ?? {},
-        ),
-      );
-      return;
-    }
-
+    final controller = WindowController.fromWindowId(windowId);
     runApp(
-      const MaterialApp(
-        home: Scaffold(body: Center(child: Text('Unknown sub-window'))),
-        debugShowCheckedModeBanner: false,
+      _SftpSubApp(
+        controller: controller,
+        profile: (data['profile'] as Map?)?.cast<String, dynamic>() ?? const {},
       ),
     );
     return;
   }
 
-  // Mode normal: jalankan aplikasi utama
   runApp(const MyApp());
 }
 
@@ -52,6 +44,23 @@ class MyApp extends StatelessWidget {
       ),
       home: const SSHClientWindow(),
       debugShowCheckedModeBanner: false,
+    );
+  }
+}
+
+class _SftpSubApp extends StatelessWidget {
+  const _SftpSubApp({required this.controller, required this.profile});
+
+  final WindowController controller;
+  final Map<String, dynamic> profile;
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(useMaterial3: true),
+      home: SftpWindow(profile: profile, controller: controller),
+      color: Colors.white,
     );
   }
 }

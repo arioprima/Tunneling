@@ -1,14 +1,16 @@
+import 'dart:convert';
 import 'dart:io';
-import 'package:flutter/material.dart';
+
 import 'package:dartssh2/dartssh2.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
-import 'login_tab.dart';
-import 'terminal_tab.dart';
-import 'sftp_tab.dart';
-import 'rdp_tab.dart';
-import 'dart:convert';
+import 'package:flutter/material.dart';
 import 'package:file_selector/file_selector.dart' as fs;
+
 import '../widgets/log_viewer.dart';
+import 'login_tab.dart';
+import 'rdp_tab.dart';
+import 'sftp_tab.dart';
+import 'terminal_tab.dart';
 
 class SSHClientWindow extends StatefulWidget {
   const SSHClientWindow({super.key});
@@ -58,40 +60,126 @@ class _SSHClientWindowState extends State<SSHClientWindow>
     });
   }
 
-  Future<void> _connectSSH(
-    String host,
-    int port,
-    String username,
-    String password,
-  ) async {
+  // ——————————————————————————————————————————————
+  // KONEKSI SSH (password / publickey / kb-interactive)
+  // ——————————————————————————————————————————————
+  Future<void> _connectSSHWith(Map<String, dynamic> c) async {
     if (_isConnecting) return;
     _isConnecting = true;
     setState(() {});
+
+    final host = c['host'] as String;
+    final port = c['port'] as int;
+    final user = c['username'] as String;
+    final method = (c['method'] as String?) ?? 'password';
+
     try {
-      _addLogMessage("Connecting to $host:$port as $username ...");
+      _addLogMessage("Connecting to $host:$port as $user ($method) ...");
 
       final socket = await SSHSocket.connect(host, port);
+
+      // Siapkan identities jika public key
+      List<SSHKeyPair>? identities;
+      SSHPasswordRequestHandler? onPasswordRequest;
+      SSHUserInfoRequestHandler? onUserInfoRequest;
+
+      if (method == 'password') {
+        onPasswordRequest = () => (c['password'] as String?) ?? '';
+      } else if (method == 'publickey') {
+        final rawPath = (c['privateKeyPath'] as String).trim();
+        final path = _expandHome(rawPath);
+
+        final file = File(path);
+        if (!file.existsSync()) {
+          throw 'File private key tidak ditemukan: $path';
+        }
+
+        final pemText = await file.readAsString();
+        final passRaw = (c['passphrase'] as String?) ?? '';
+        final passphrase = passRaw.isEmpty ? null : passRaw;
+
+        // Kunci dari PEM (mendukung OpenSSH/PKCS#8/RSA klasik, terenkripsi OK)
+        identities = SSHKeyPair.fromPem(pemText, passphrase);
+
+        // optional: password fallback kalau server minta
+        if ((c['enablePasswordFallback'] as bool?) == true) {
+          final fb = (c['fallbackPassword'] as String?) ?? '';
+          if (fb.isNotEmpty) {
+            onPasswordRequest = () => fb;
+          } else {
+            onPasswordRequest = () async => await _promptSecret(
+              title: 'Password Fallback',
+              placeholder: 'Masukkan password (opsional)',
+            );
+          }
+        }
+      } else if (method == 'keyboard-interactive') {
+        // Dipanggil ketika server kirim prompt interaktif
+        onUserInfoRequest = (req) async {
+          final answers = <String>[];
+
+          final title = (req.name.isNotEmpty) ? req.name : 'Authentication';
+
+          for (final promptObj in req.prompts) {
+            // Akses dinamis agar aman lintas versi dartssh2
+            final d = promptObj as dynamic;
+
+            String message;
+            bool echo;
+
+            // Beberapa versi pakai `prompt`, sebagian pakai `text`
+            try {
+              message = d.prompt as String;
+            } catch (_) {
+              try {
+                message = d.text as String;
+              } catch (_) {
+                message = 'Input'; // fallback
+              }
+            }
+
+            try {
+              echo = (d.echo as bool?) ?? true;
+            } catch (_) {
+              echo = true;
+            }
+
+            final a = await _promptUserInput(
+              title: title,
+              message: message,
+              echo: echo, // false => sembunyikan input
+            );
+
+            if (a == null) return null; // user cancel
+            answers.add(a);
+          }
+          return answers;
+        };
+      }
       _client = SSHClient(
         socket,
-        username: username,
-        onPasswordRequest: () => password,
-        // TODO: tambahkan verifikasi host key untuk keamanan production.
+        username: user,
+        identities: identities, // <-- List<SSHKeyPair> untuk .pem
+        onPasswordRequest: onPasswordRequest, // <-- password / fallback
+        onUserInfoRequest: onUserInfoRequest, // <-- keyboard-interactive
+        // TODO: onVerifyHostKey untuk production (fingerprint).
       );
 
       setState(() => _isConnected = true);
-      _addLogMessage("✅ SSH connected to $host as $username");
+      _addLogMessage("✅ SSH connected to $host as $user");
 
-      final result = await _client!.execute("uname -a");
-      _addLogMessage("Remote: ${result.toString().trim()}");
-
-      // _tabController.animateTo(2); // pindah ke Terminal
+      // Tes ringan (abaikan jika perintah tidak tersedia)
+      try {
+        final result = await _client!.execute("uname -a");
+        _addLogMessage("Remote: ${result.toString().trim()}");
+      } catch (_) {}
     } catch (e) {
       _addLogMessage("❌ SSH Error: $e");
       setState(() {
         _isConnected = false;
         _client = null;
       });
-      if (context.mounted) {
+      if (mounted) {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text('Gagal connect: $e')));
@@ -100,6 +188,97 @@ class _SSHClientWindowState extends State<SSHClientWindow>
       _isConnecting = false;
       if (mounted) setState(() {});
     }
+  }
+
+  String _expandHome(String path) {
+    if (path.startsWith('~')) {
+      final home =
+          Platform.environment['HOME'] ??
+          Platform.environment['UserProfile'] ??
+          '';
+      if (home.isNotEmpty) {
+        return path.replaceFirst('~', home);
+      }
+    }
+    return path;
+  }
+
+  Future<String> _promptSecret({
+    String title = 'Authentication',
+    String placeholder = 'Password',
+  }) async {
+    final ctrl = TextEditingController();
+    String? value;
+    if (!mounted) return '';
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          obscureText: true,
+          decoration: InputDecoration(hintText: placeholder),
+          onSubmitted: (_) => Navigator.of(ctx).pop(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              value = '';
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              value = ctrl.text;
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    return value ?? '';
+  }
+
+  Future<String?> _promptUserInput({
+    required String title,
+    required String message,
+    bool echo = true,
+  }) async {
+    final controller = TextEditingController();
+    return showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => AlertDialog(
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(message),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              obscureText: !echo,
+              autofocus: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(null),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.of(context).pop(controller.text),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _disconnectSSH() {
@@ -123,20 +302,7 @@ class _SSHClientWindowState extends State<SSHClientWindow>
   void _connectFromLoginTab() {
     final creds = _loginKey.currentState?.readCredentials();
     if (creds == null) return; // validasi sudah ditangani di LoginTab
-    // UI fokus dulu: hanya password flow.
-    if ((creds['method'] ?? 'password') != 'password') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Demo UI: sementara dukung method password dulu.'),
-        ),
-      );
-    }
-    _connectSSH(
-      creds['host'] as String,
-      creds['port'] as int,
-      creds['username'] as String,
-      (creds['password'] ?? '') as String,
-    );
+    _connectSSHWith(creds);
   }
 
   @override
@@ -292,9 +458,9 @@ class _SSHClientWindowState extends State<SSHClientWindow>
     );
   }
 
-  /// ————————————————————————————————————————————————————————————————
-  /// Sidebar: Bitvise-like dynamic menu
-  /// ————————————————————————————————————————————————————————————————
+  // ————————————————————————————————————————————————————————————————
+  // Sidebar: Bitvise-like dynamic menu
+  // ————————————————————————————————————————————————————————————————
 
   Widget _buildModernSidebar() {
     final items = _isConnected
@@ -486,17 +652,8 @@ class _SSHClientWindowState extends State<SSHClientWindow>
       icon: Icons.folder_outlined,
       title: 'New SFTP Window',
       color: Colors.orange,
-      onTap: _openNewSftpWindow, // ⬅️ ganti ke fungsi baru ini
+      onTap: _openNewSftpWindow,
     ),
-    // _SidebarItem(
-    //   icon: Icons.folder_outlined,
-    //   title: 'New SFTP Window',
-    //   color: Colors.orange,
-    //   onTap: () {
-    //     _tabController.animateTo(4);
-    //     _addLogMessage('New SFTP window opened');
-    //   },
-    // ),
     _SidebarItem(
       icon: Icons.desktop_windows_outlined,
       title: 'New Remote Desktop',
@@ -508,15 +665,14 @@ class _SSHClientWindowState extends State<SSHClientWindow>
     ),
   ];
 
-  // ——— Sidebar actions (UI-only for now) ———
+  // ——— Sidebar actions (UI) ———
   void _uiLoadProfile() async {
     try {
-      // Buka file dialog
       final fs.XFile? file = await fs.openFile(
         acceptedTypeGroups: const [
           fs.XTypeGroup(
             label: 'SSH Client Pro Profile',
-            extensions: ['sshp', 'json', 'tlp', 'bscp'], // dukung ekstensi ini
+            extensions: ['sshp', 'json', 'tlp', 'bscp'],
           ),
         ],
       );
@@ -528,7 +684,6 @@ class _SSHClientWindowState extends State<SSHClientWindow>
 
       final content = await file.readAsString();
 
-      // Coba parse JSON
       late final Map<String, dynamic> map;
       try {
         map = json.decode(content) as Map<String, dynamic>;
@@ -544,10 +699,8 @@ class _SSHClientWindowState extends State<SSHClientWindow>
         return;
       }
 
-      // Bangun objek profile
       final profile = SSHProfile.fromJson(map);
 
-      // Oper ke LoginTab supaya field terisi
       _loginKey.currentState?.applyProfile({
         'profileName': profile.name,
         'host': profile.host,
@@ -556,6 +709,8 @@ class _SSHClientWindowState extends State<SSHClientWindow>
         'method': profile.method,
         'password': profile.password,
         'privateKeyPath': profile.privateKeyPath,
+        // ⬇️ ikutkan passphrase
+        'passphrase': profile.privateKeyPassphrase,
       });
 
       _addLogMessage('✅ Profile dimuat: ${profile.name}');
@@ -563,7 +718,6 @@ class _SSHClientWindowState extends State<SSHClientWindow>
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Profile dimuat: ${profile.name}')),
         );
-        // Opsional: tampilkan form Login agar user bisa cek/ubah
         _tabController.animateTo(0);
       }
     } catch (e) {
@@ -605,6 +759,10 @@ class _SSHClientWindowState extends State<SSHClientWindow>
           ? data['password'] as String
           : null,
       privateKeyPath: data['privateKeyPath'] as String?,
+      // ⬇️ SIMPAN passphrase (opsional)
+      privateKeyPassphrase: (data['passphrase'] as String?)?.isNotEmpty == true
+          ? data['passphrase'] as String
+          : null,
       autoSwitchAfterConnect: false,
     );
 
@@ -614,7 +772,6 @@ class _SSHClientWindowState extends State<SSHClientWindow>
       ).convert(profile.toJson());
       final fileName = '${profile.name}.sshp';
 
-      // 🔧 API baru:
       final fs.FileSaveLocation? loc = await fs.getSaveLocation(
         suggestedName: fileName,
         acceptedTypeGroups: const [
@@ -653,11 +810,8 @@ class _SSHClientWindowState extends State<SSHClientWindow>
   }
 
   void _uiNewProfile() {
-    // Reset form login ke default (UI)
     _tabController.animateTo(0);
     _addLogMessage('New Profile: reset form ke default');
-    // Tidak memanggil setState di LoginTab; biasanya kita expose method di LoginTabState untuk clear.
-    // Untuk demo, cukup informasikan ke pengguna.
   }
 
   void _uiResetProfile() {
@@ -669,7 +823,6 @@ class _SSHClientWindowState extends State<SSHClientWindow>
   }
 
   Future<void> _openNewSftpWindow() async {
-    // Ambil data login dari LoginTab
     final data = _loginKey.currentState?.readCredentials();
     if (data == null) {
       if (!mounted) return;
@@ -680,7 +833,6 @@ class _SSHClientWindowState extends State<SSHClientWindow>
       return;
     }
 
-    // Susun profile yang akan dikirim ke sub-window
     final profile = SSHProfile(
       name: (data['profileName'] as String?)?.trim().isNotEmpty == true
           ? data['profileName'] as String
@@ -693,6 +845,10 @@ class _SSHClientWindowState extends State<SSHClientWindow>
           ? data['password'] as String
           : null,
       privateKeyPath: data['privateKeyPath'] as String?,
+      // ⬇️ ikutkan passphrase ke window SFTP
+      privateKeyPassphrase: (data['passphrase'] as String?)?.isNotEmpty == true
+          ? data['passphrase'] as String
+          : null,
     );
 
     final args = jsonEncode({'kind': 'sftp', 'profile': profile.toJson()});
@@ -713,9 +869,9 @@ class _SSHClientWindowState extends State<SSHClientWindow>
     }
   }
 
-  /// ————————————————————————————————————————————————————————————————
-  /// BOTTOM: Logs & Actions
-  /// ————————————————————————————————————————————————————————————————
+  // ————————————————————————————————————————————————————————————————
+  // BOTTOM: Logs & Actions
+  // ————————————————————————————————————————————————————————————————
 
   Widget _buildModernTabBar() {
     return Container(
@@ -928,9 +1084,10 @@ class SSHProfile {
   final String host;
   final int port;
   final String username;
-  final String method; // 'password' | 'key' (future)
+  final String method; // 'password' | 'publickey' | 'keyboard-interactive'
   final String? password; // ⚠️ plain text kalau diisi
   final String? privateKeyPath;
+  final String? privateKeyPassphrase; // ⬅️ baru
   final bool autoSwitchAfterConnect;
 
   SSHProfile({
@@ -941,6 +1098,7 @@ class SSHProfile {
     required this.method,
     this.password,
     this.privateKeyPath,
+    this.privateKeyPassphrase, // ⬅️ baru
     this.autoSwitchAfterConnect = false,
   });
 
@@ -953,6 +1111,7 @@ class SSHProfile {
     'method': method,
     'password': password, // boleh null
     'privateKeyPath': privateKeyPath,
+    'privateKeyPassphrase': privateKeyPassphrase, // ⬅️ baru
     'ui': {'autoSwitchAfterConnect': autoSwitchAfterConnect},
   };
 
@@ -964,6 +1123,7 @@ class SSHProfile {
     method: (json['method'] as String?) ?? 'password',
     password: json['password'] as String?,
     privateKeyPath: json['privateKeyPath'] as String?,
+    privateKeyPassphrase: json['privateKeyPassphrase'] as String?, // ⬅️ baru
     autoSwitchAfterConnect:
         (json['ui']?['autoSwitchAfterConnect'] as bool?) ?? false,
   );

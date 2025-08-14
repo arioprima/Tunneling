@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:file_selector/file_selector.dart' as fs;
 
 class LoginTab extends StatefulWidget {
   final bool isConnecting;
@@ -53,8 +54,33 @@ class LoginTabState extends State<LoginTab> {
     super.initState();
   }
 
+  /// Buka dialog untuk memilih file private key (.pem/.ppk/.key)
+  Future<void> _pickPrivateKey() async {
+    final typeGroup = fs.XTypeGroup(
+      label: 'SSH private keys',
+      // tanpa titik, hanya ekstensi
+      extensions: ['pem', 'ppk', 'key', 'openssh', 'rsa', 'ed25519'],
+    );
+
+    final xfile = await fs.openFile(acceptedTypeGroups: [typeGroup]);
+    if (xfile == null) return;
+
+    setState(() {
+      // Di desktop path biasanya tersedia; di web bisa null (pakai name)
+      _keyPathController.text = xfile.path ?? xfile.name;
+      if (_authMethod != 'publickey') _authMethod = 'publickey';
+    });
+
+    final nameLower = (xfile.name).toLowerCase();
+    if (nameLower.endsWith('.ppk')) {
+      _toast(
+        'File .ppk terdeteksi. Sebaiknya konversi ke OpenSSH (.pem):\n'
+        'puttygen "${xfile.path ?? xfile.name}" -O private-openssh -o id_private.pem',
+      );
+    }
+  }
+
   void applyProfile(Map<String, dynamic> p) {
-    // helper untuk baca nested key "kerberos"
     Map<String, dynamic> kerb(Map<String, dynamic> src) =>
         (src['kerberos'] is Map<String, dynamic>)
         ? (src['kerberos'] as Map<String, dynamic>)
@@ -96,7 +122,6 @@ class LoginTabState extends State<LoginTab> {
           _authMethod = 'password';
           _passwordController.text = (p['password'] ?? '') as String;
           _storePassword = (p['storePassword'] as bool?) ?? false;
-          // bersihkan field PK agar UI rapi
           _keyPathController.clear();
           _keyPassphraseController.clear();
           _enablePasswordFallback = true;
@@ -108,15 +133,12 @@ class LoginTabState extends State<LoginTab> {
           _keyPassphraseController.text = (p['passphrase'] ?? '') as String;
           _enablePasswordFallback =
               (p['enablePasswordFallback'] as bool?) ?? true;
-          // fallback password (opsional)
           _passwordController.text = (p['fallbackPassword'] ?? '') as String;
-          // bersihkan field password utama agar tidak rancu
           _storePassword = false;
           break;
 
         case 'keyboard-interactive':
           _authMethod = 'keyboard-interactive';
-          // clear semua secret supaya aman
           _passwordController.clear();
           _keyPathController.clear();
           _keyPassphraseController.clear();
@@ -156,6 +178,7 @@ class LoginTabState extends State<LoginTab> {
       case 'none':
         _toast('Pilih Initial method terlebih dahulu');
         return null;
+
       case 'password':
         return {
           'host': host,
@@ -176,6 +199,7 @@ class LoginTabState extends State<LoginTab> {
             'gssapiKeyex': _gssapiKeyex,
           },
         };
+
       case 'publickey':
         if (_keyPathController.text.trim().isEmpty) {
           _toast('Path private key (.pem/.ppk) wajib diisi');
@@ -189,7 +213,7 @@ class LoginTabState extends State<LoginTab> {
           'privateKeyPath': _keyPathController.text.trim(),
           'passphrase': _keyPassphraseController.text,
           'enablePasswordFallback': _enablePasswordFallback,
-          // optional fallback password if UI menyiapkannya (tidak wajib)
+          // optional fallback password (opsional)
           'fallbackPassword': _enablePasswordFallback
               ? _passwordController.text
               : null,
@@ -204,6 +228,7 @@ class LoginTabState extends State<LoginTab> {
             'gssapiKeyex': _gssapiKeyex,
           },
         };
+
       case 'keyboard-interactive':
         return {
           'host': host,
@@ -221,6 +246,7 @@ class LoginTabState extends State<LoginTab> {
             'gssapiKeyex': _gssapiKeyex,
           },
         };
+
       default:
         _toast('Metode tidak dikenali');
         return null;
@@ -426,6 +452,7 @@ class LoginTabState extends State<LoginTab> {
             disabled ? null : (v) => setState(() => _storePassword = v!),
           ),
         ];
+
       case 'publickey':
         return [
           _buildInputRow(
@@ -464,33 +491,26 @@ class LoginTabState extends State<LoginTab> {
           Align(
             alignment: Alignment.centerLeft,
             child: TextButton.icon(
-              onPressed: disabled
-                  ? null
-                  : () {
-                      // Hindari dependency tambahan agar file tetap compile.
-                      // Jika ingin file picker, tambahkan package `file_picker`
-                      // dan gunakan FilePicker.platform.pickFiles() di sini.
-                      _toast(
-                        'Tambahkan package file_picker untuk browse file.',
-                      );
-                    },
+              onPressed: disabled ? null : _pickPrivateKey,
               icon: const Icon(Icons.folder_open),
               label: const Text('Browse…'),
             ),
           ),
         ];
+
       case 'keyboard-interactive':
-        return [
-          const Text(
+        return const [
+          Text(
             'Keyboard-interactive tidak membutuhkan input awal.\n'
             'Saat koneksi, server akan mengirim prompt (mis. OTP/Password AD).',
             style: TextStyle(fontSize: 12, color: Colors.black54),
           ),
         ];
+
       case 'none':
       default:
-        return [
-          const Text(
+        return const [
+          Text(
             'Pilih Initial method untuk menampilkan isian yang sesuai.',
             style: TextStyle(fontSize: 12, color: Colors.black54),
           ),
@@ -603,7 +623,6 @@ class LoginTabState extends State<LoginTab> {
         SizedBox(
           height: 36,
           child: Theme(
-            // ← lokal saja, hanya untuk dropdown ini
             data: Theme.of(context).copyWith(
               colorScheme: Theme.of(
                 context,
@@ -614,8 +633,8 @@ class LoginTabState extends State<LoginTab> {
             ),
             child: DropdownButtonFormField<String>(
               value: value,
-              dropdownColor: Colors.white, // menu popup-nya putih
-              menuMaxHeight: 280, // opsional: biar gak terlalu tinggi
+              dropdownColor: Colors.white,
+              menuMaxHeight: 280,
               style: const TextStyle(fontSize: 14, color: Colors.black87),
               decoration: InputDecoration(
                 border: OutlineInputBorder(

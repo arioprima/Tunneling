@@ -1,0 +1,10 @@
+Package: bitvise
+Version: 1.0.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Your Name <you@example.com>
+Homepage: https://example.com
+Depends: libc6, libstdc++6, libgtk-3-0, liblzma5, libx11-6, libxcb1, libxkbcommon0, libxi6, libxtst6
+Description: bitvise (Flutter) with multi-window + SFTP
+ A Flutter-based SSH/SFTP client.

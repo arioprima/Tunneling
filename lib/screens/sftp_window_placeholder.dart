@@ -1,16 +1,26 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
+import 'dart:ui';
+
+import 'package:flutter/gestures.dart' show kSecondaryMouseButton;
+import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:dartssh2/dartssh2.dart';
 import 'package:file_selector/file_selector.dart' as fs;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 import 'ssh_client_window.dart' show SSHProfile;
 
 class SftpWindow extends StatefulWidget {
   final Map<String, dynamic> profile;
-  const SftpWindow({super.key, required this.profile});
+  final WindowController controller;
+
+  const SftpWindow({
+    super.key,
+    required this.profile,
+    required this.controller,
+  });
 
   @override
   State<SftpWindow> createState() => _SftpWindowState();
@@ -34,14 +44,11 @@ class _SftpWindowState extends State<SftpWindow> {
   String _localFilter = '';
   String _remoteFilter = '';
 
-  int? _selectedLocal; // untuk aksi single (rename/delete)
+  int? _selectedLocal;
   int? _selectedRemote;
 
-  // === Multi-select states (tanpa checkbox) ===
   Set<int> _selLocal = {};
   Set<int> _selRemote = {};
-
-  // Anchor untuk Shift+klik rentang
   int? _anchorLocal, _anchorRemote;
 
   bool _busy = false;
@@ -49,9 +56,10 @@ class _SftpWindowState extends State<SftpWindow> {
   String? _status;
   double? _progress;
 
-  late final SSHProfile _profile;
+  late SSHProfile _profile;
+  bool _profileReady = false;
 
-  // ==== helper status tombol modifier ====
+  // ===== modifier keys =====
   bool get _shiftDown {
     final keys = HardwareKeyboard.instance.logicalKeysPressed;
     return keys.contains(LogicalKeyboardKey.shiftLeft) ||
@@ -69,8 +77,34 @@ class _SftpWindowState extends State<SftpWindow> {
   @override
   void initState() {
     super.initState();
-    _profile = SSHProfile.fromJson(widget.profile);
-    _connect();
+
+    ErrorWidget.builder = (details) {
+      return Scaffold(
+        backgroundColor: Colors.white,
+        body: Center(
+          child: Text(
+            'Terjadi error:\n${details.exceptionAsString()}',
+            textAlign: TextAlign.center,
+          ),
+        ),
+      );
+    };
+    PlatformDispatcher.instance.onError = (e, st) {
+      _setBanner('Error: $e');
+      return true;
+    };
+
+    try {
+      _profile = SSHProfile.fromJson(widget.profile);
+      _profileReady = true;
+    } catch (e) {
+      _profileReady = false;
+      _setBanner('Profil SSH tidak valid: $e');
+    }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (_profileReady) _connect();
+    });
   }
 
   @override
@@ -90,6 +124,81 @@ class _SftpWindowState extends State<SftpWindow> {
     return Platform.environment['HOME'] ?? Directory.current.path;
   }
 
+  String _expandHome(String path) {
+    if (path.startsWith('~')) {
+      final home =
+          Platform.environment['HOME'] ??
+          Platform.environment['UserProfile'] ??
+          '';
+      if (home.isNotEmpty) return path.replaceFirst('~', home);
+    }
+    return path;
+  }
+
+  Future<String> _promptSecret({
+    String title = 'Authentication',
+    String placeholder = 'Passphrase',
+  }) async {
+    final ctrl = TextEditingController();
+    String? value;
+    if (!mounted) return '';
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          obscureText: true,
+          decoration: InputDecoration(hintText: placeholder),
+          onSubmitted: (_) => Navigator.of(ctx).pop(),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              value = '';
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              value = ctrl.text;
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    return value ?? '';
+  }
+
+  Future<List<SSHKeyPair>> _loadKeyPairs() async {
+    final keyPath = _profile.privateKeyPath;
+    if (keyPath == null || keyPath.trim().isEmpty) return const [];
+
+    final full = _expandHome(keyPath.trim());
+    final file = File(full);
+    if (!file.existsSync()) {
+      throw 'File private key tidak ditemukan: $full';
+    }
+
+    final pem = await file.readAsString();
+
+    try {
+      return SSHKeyPair.fromPem(pem, null);
+    } catch (_) {
+      final pass = await _promptSecret(
+        title: 'Private key passphrase',
+        placeholder: 'Masukkan passphrase',
+      );
+      if (pass.isEmpty) rethrow;
+      return SSHKeyPair.fromPem(pem, pass);
+    }
+  }
+
   void _syncPathCtrls() {
     _localPathCtrl.text = _localPath;
     _remotePathCtrl.text = _remotePath;
@@ -100,13 +209,18 @@ class _SftpWindowState extends State<SftpWindow> {
     _setBusy(true, status: 'Connecting to ${_profile.host} ...');
     try {
       final sock = await SSHSocket.connect(_profile.host, _profile.port);
+
+      final keypairs = await _loadKeyPairs().catchError((e) {
+        _setBanner('Private key error: $e');
+        return <SSHKeyPair>[];
+      });
+
       final ssh = SSHClient(
         sock,
         username: _profile.username,
+        identities: keypairs.isEmpty ? null : keypairs,
         onPasswordRequest: () => _profile.password ?? '',
       );
-
-      await _sshRun(ssh, 'echo CONNECTED');
 
       final sftp = await ssh.sftp();
 
@@ -127,11 +241,7 @@ class _SftpWindowState extends State<SftpWindow> {
 
       if (!await canList(remoteHome)) {
         final alt = '/home/${_profile.username}';
-        if (await canList(alt)) {
-          remoteHome = alt;
-        } else {
-          remoteHome = '/';
-        }
+        remoteHome = await canList(alt) ? alt : '/';
       }
 
       _ssh = ssh;
@@ -141,6 +251,8 @@ class _SftpWindowState extends State<SftpWindow> {
       await Future.wait([_loadLocal(), _loadRemote()]);
       _syncPathCtrls();
       _setStatus('Connected: ${_profile.username}@${_profile.host}');
+    } on SSHAuthFailError catch (e) {
+      _setBanner('SFTP auth gagal: ${e.message}');
     } catch (e) {
       _setBanner('SFTP Error: $e');
     } finally {
@@ -202,7 +314,7 @@ class _SftpWindowState extends State<SftpWindow> {
     _localAll = items;
     _localFiles = _applyFilter(items, _localFilter);
     _selectedLocal = null;
-    _selLocal.clear(); // reset multi-select agar index tidak nyasar
+    _selLocal.clear();
     _anchorLocal = null;
     _syncPathCtrls();
     if (mounted) setState(() {});
@@ -251,12 +363,18 @@ class _SftpWindowState extends State<SftpWindow> {
         }
       }
 
+      int size = 0;
+      try {
+        final st = await sftp.stat(full);
+        size = st.size ?? 0;
+      } catch (_) {}
+
       items.add(
         _FileItem(
           name: name,
           path: full,
           isDir: isDir,
-          size: 0,
+          size: size,
           modified: null,
         ),
       );
@@ -265,7 +383,7 @@ class _SftpWindowState extends State<SftpWindow> {
     _remoteAll = items;
     _remoteFiles = _applyFilter(items, _remoteFilter);
     _selectedRemote = null;
-    _selRemote.clear(); // reset multi-select
+    _selRemote.clear();
     _anchorRemote = null;
     _syncPathCtrls();
     if (mounted) setState(() {});
@@ -314,6 +432,48 @@ class _SftpWindowState extends State<SftpWindow> {
     }, 'Mkdir "$name"');
   }
 
+  Future<void> _remoteRename(_FileItem it) async {
+    final newName = await _prompt('Rename', initial: it.name);
+    if (newName == null || newName.trim().isEmpty || newName == it.name) return;
+    final parent = p.posix.dirname(it.path);
+    final to = p.posix.normalize(p.posix.join(parent, newName.trim()));
+    await _guard(() async {
+      await _sftp!.rename(it.path, to);
+      await _loadRemote();
+    }, 'Rename "${it.name}"');
+  }
+
+  Future<void> _remoteDeletePath(String path) async {
+    if (await _remoteIsDir(path)) {
+      final entries = await _sftp!.listdir(path);
+      for (final e in entries) {
+        final name = e.filename;
+        if (name == '.' || name == '..') continue;
+        final child = p.posix.join(path, name);
+        await _remoteDeletePath(child);
+      }
+      await _sftp!.rmdir(path);
+    } else {
+      await _sftp!.remove(path);
+    }
+  }
+
+  Future<void> _remoteDeleteSelected() async {
+    final items = _getRemoteSelection();
+    if (items.isEmpty) return;
+    final ok = await _confirm(
+      'Hapus ${items.length} item di Remote?\nTindakan ini tidak bisa dibatalkan.',
+    );
+    if (!ok) return;
+    await _guard(() async {
+      for (final it in items) {
+        if (it.isUp) continue;
+        await _remoteDeletePath(it.path);
+      }
+      await _loadRemote();
+    }, 'Delete');
+  }
+
   // ------------------- LOCAL ACTIONS -------------------
   Future<void> _localMkdir() async {
     final name = await _prompt('New folder name');
@@ -325,7 +485,42 @@ class _SftpWindowState extends State<SftpWindow> {
     }, 'Mkdir "$name"');
   }
 
-  // ------------------- TRANSFERS (COPY, bukan move) -------------------
+  Future<void> _localRename(_FileItem it) async {
+    final newName = await _prompt('Rename', initial: it.name);
+    if (newName == null || newName.trim().isEmpty || newName == it.name) return;
+    final parent = p.dirname(it.path);
+    final to = p.normalize(p.join(parent, newName.trim()));
+    await _guard(() async {
+      if (it.isDir) {
+        await Directory(it.path).rename(to);
+      } else {
+        await File(it.path).rename(to);
+      }
+      await _loadLocal();
+    }, 'Rename "${it.name}"');
+  }
+
+  Future<void> _localDeleteSelected() async {
+    final items = _getLocalSelection();
+    if (items.isEmpty) return;
+    final ok = await _confirm(
+      'Hapus ${items.length} item di Local?\nTindakan ini tidak bisa dibatalkan.',
+    );
+    if (!ok) return;
+    await _guard(() async {
+      for (final it in items) {
+        if (it.isUp) continue;
+        if (it.isDir) {
+          await Directory(it.path).delete(recursive: true);
+        } else {
+          await File(it.path).delete();
+        }
+      }
+      await _loadLocal();
+    }, 'Delete');
+  }
+
+  // ------------------- TRANSFERS -------------------
   Stream<Uint8List> _localFileChunkStream(
     File file, {
     int chunkSize = 64 * 1024,
@@ -379,7 +574,6 @@ class _SftpWindowState extends State<SftpWindow> {
         },
       );
 
-      // <- KUNCI: tulis dari Stream<Uint8List>, bukan Uint8List langsung
       await f.write(stream, offset: 0);
       await f.close();
 
@@ -395,7 +589,7 @@ class _SftpWindowState extends State<SftpWindow> {
       int? size;
       try {
         final st = await sftp.stat(remotePath);
-        size = st.size?.toInt();
+        size = st.size;
       } catch (_) {}
 
       final f = await sftp.open(remotePath, mode: SftpFileOpenMode.read);
@@ -422,8 +616,7 @@ class _SftpWindowState extends State<SftpWindow> {
           if (size != null && size > 0) {
             _progress = received / size;
             _setStatus(
-              'Downloading ${p.basename(remotePath)} '
-              '(${_fmtSize(received)}/${_fmtSize(size)})',
+              'Downloading ${p.basename(remotePath)} (${_fmtSize(received)}/${_fmtSize(size)})',
             );
             if (mounted) setState(() {});
           }
@@ -491,21 +684,13 @@ class _SftpWindowState extends State<SftpWindow> {
     }, 'Download folder "${p.basename(remoteDir)}"');
   }
 
-  // -------- COPY berdasarkan MULTI-SELECT (tanpa checkbox) --------
+  // -------- COPY berdasarkan MULTI-SELECT --------
   Future<void> _copyLocalSelectionToRemote() async {
-    final List<_FileItem> items = _selLocal.isNotEmpty
-        ? _selLocal
-              .where((i) => i >= 0 && i < _localFiles.length)
-              .map((i) => _localFiles[i])
-              .where((it) => !it.isUp)
-              .toList()
-        : (_selectedLocal != null ? [_localFiles[_selectedLocal!]] : []);
-
+    final items = _getLocalSelection();
     if (items.isEmpty) {
       _toast('Tidak ada item Local yang dipilih.');
       return;
     }
-
     for (final it in items) {
       if (it.isDir) {
         final remoteTarget = p.posix.join(_remotePath, it.name);
@@ -517,19 +702,11 @@ class _SftpWindowState extends State<SftpWindow> {
   }
 
   Future<void> _copyRemoteSelectionToLocal() async {
-    final List<_FileItem> items = _selRemote.isNotEmpty
-        ? _selRemote
-              .where((i) => i >= 0 && i < _remoteFiles.length)
-              .map((i) => _remoteFiles[i])
-              .where((it) => !it.isUp)
-              .toList()
-        : (_selectedRemote != null ? [_remoteFiles[_selectedRemote!]] : []);
-
+    final items = _getRemoteSelection();
     if (items.isEmpty) {
       _toast('Tidak ada item Remote yang dipilih.');
       return;
     }
-
     for (final it in items) {
       if (it.isDir || await _remoteIsDir(it.path)) {
         await _downloadDirectory(it.path, _localPath);
@@ -569,13 +746,13 @@ class _SftpWindowState extends State<SftpWindow> {
     }
   }
 
-  // ------------------- SELEKSI: klik, Shift+klik, Ctrl/Cmd+klik -------------------
+  // ------------------- SELEKSI -------------------
   void _tapSelect({required bool isRemote, required int index}) {
     final files = isRemote ? _remoteFiles : _localFiles;
     final sel = isRemote ? _selRemote : _selLocal;
 
     if (index < 0 || index >= files.length) return;
-    if (files[index].isUp) return; // abaikan '..'
+    if (files[index].isUp) return;
 
     int? anchor = isRemote ? _anchorRemote : _anchorLocal;
 
@@ -587,14 +764,13 @@ class _SftpWindowState extends State<SftpWindow> {
           if (!files[i].isUp) i,
       };
       if (_ctrlCmdDown) {
-        sel.addAll(range); // extend selection
+        sel.addAll(range);
       } else {
         sel
           ..clear()
-          ..addAll(range); // replace selection
+          ..addAll(range);
       }
     } else if (_ctrlCmdDown) {
-      // toggle item tunggal
       if (sel.contains(index)) {
         sel.remove(index);
       } else {
@@ -602,7 +778,6 @@ class _SftpWindowState extends State<SftpWindow> {
       }
       anchor = index;
     } else {
-      // klik biasa → single selection
       sel
         ..clear()
         ..add(index);
@@ -617,6 +792,57 @@ class _SftpWindowState extends State<SftpWindow> {
       _anchorLocal = anchor;
     }
     setState(() {});
+  }
+
+  // ---- paksa seleksi saat klik-kanan pada item yang belum terseleksi
+  void _forceSelect({required bool isRemote, required int index}) {
+    if (isRemote) {
+      if (index < 0 || index >= _remoteFiles.length) return;
+      if (_remoteFiles[index].isUp) return;
+      _selRemote = {index};
+      _selectedRemote = index;
+      _anchorRemote = index;
+    } else {
+      if (index < 0 || index >= _localFiles.length) return;
+      if (_localFiles[index].isUp) return;
+      _selLocal = {index};
+      _selectedLocal = index;
+      _anchorLocal = index;
+    }
+    if (mounted) setState(() {});
+  }
+
+  // ---- helpers untuk selection list ----
+  List<_FileItem> _getLocalSelection({int? ensureIndex}) {
+    if (ensureIndex != null && !_selLocal.contains(ensureIndex)) {
+      _selLocal = {ensureIndex};
+      _selectedLocal = ensureIndex;
+      _anchorLocal = ensureIndex;
+      setState(() {});
+    }
+    return _selLocal.isNotEmpty
+        ? _selLocal
+              .where((i) => i >= 0 && i < _localFiles.length)
+              .map((i) => _localFiles[i])
+              .where((it) => !it.isUp)
+              .toList()
+        : (_selectedLocal != null ? [_localFiles[_selectedLocal!]] : []);
+  }
+
+  List<_FileItem> _getRemoteSelection({int? ensureIndex}) {
+    if (ensureIndex != null && !_selRemote.contains(ensureIndex)) {
+      _selRemote = {ensureIndex};
+      _selectedRemote = ensureIndex;
+      _anchorRemote = ensureIndex;
+      setState(() {});
+    }
+    return _selRemote.isNotEmpty
+        ? _selRemote
+              .where((i) => i >= 0 && i < _remoteFiles.length)
+              .map((i) => _remoteFiles[i])
+              .where((it) => !it.isUp)
+              .toList()
+        : (_selectedRemote != null ? [_remoteFiles[_selectedRemote!]] : []);
   }
 
   // ------------------- UI HELPERS -------------------
@@ -677,6 +903,99 @@ class _SftpWindowState extends State<SftpWindow> {
     );
   }
 
+  Future<bool> _confirm(String message) async {
+    bool ok = false;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Konfirmasi'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Tidak'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              ok = true;
+              Navigator.pop(context);
+            },
+            child: const Text('Ya'),
+          ),
+        ],
+      ),
+    );
+    return ok;
+  }
+
+  Future<void> _showPropertiesLocal(_FileItem it) async {
+    final FileStat? st = it.isDir ? null : File(it.path).statSync();
+    final size = it.isDir ? null : st?.size;
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Properties (Local)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Name : ${it.name}'),
+            Text('Path : ${it.path}'),
+            Text('Type : ${it.isDir ? "Folder" : "File"}'),
+            Text('Size : ${it.isDir ? "-" : _fmtSize(size ?? 0)}'),
+            if (it.modified != null)
+              Text('Modified : ${_fmtTime(it.modified!)}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showPropertiesRemote(_FileItem it) async {
+    int? sz;
+    DateTime? mtime;
+    try {
+      final st = await _sftp!.stat(it.path);
+      sz = st.size;
+      final mt = st.modifyTime;
+      if (mt != null) {
+        mtime = DateTime.fromMillisecondsSinceEpoch(
+          mt * 1000,
+          isUtc: true,
+        ).toLocal();
+      }
+    } catch (_) {}
+    await showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Properties (Remote)'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Name : ${it.name}'),
+            Text('Path : ${it.path}'),
+            Text('Type : ${it.isDir ? "Folder" : "File"}'),
+            Text('Size : ${it.isDir ? "-" : _fmtSize(sz ?? 0)}'),
+            if (mtime != null) Text('Modified : ${_fmtTime(mtime)}'),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _toast(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
@@ -703,434 +1022,522 @@ class _SftpWindowState extends State<SftpWindow> {
     return '$y-$m-$d $hh:$mm';
   }
 
+  // ------------------- CONTEXT MENUS -------------------
+  Future<void> _showLocalContextMenu({required Offset pos, int? index}) async {
+    final items = _getLocalSelection(ensureIndex: index);
+    final single = items.length == 1 ? items.first : null;
+    final isOnItem =
+        index != null &&
+        index >= 0 &&
+        index < _localFiles.length &&
+        !_localFiles[index].isUp;
+
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      items: [
+        if (isOnItem && (single?.isDir ?? true))
+          const PopupMenuItem(value: 'open', child: Text('Open')),
+        if (isOnItem)
+          const PopupMenuItem(value: 'upload', child: Text('Upload to Remote')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'newFolder', child: Text('New Folder')),
+        if (isOnItem && items.length == 1)
+          const PopupMenuItem(value: 'rename', child: Text('Rename')),
+        if (isOnItem)
+          const PopupMenuItem(value: 'delete', child: Text('Delete')),
+        const PopupMenuItem(value: 'refresh', child: Text('Refresh')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'selectAll', child: Text('Select All')),
+        const PopupMenuItem(value: 'clearSel', child: Text('Clear Selection')),
+        if (isOnItem) const PopupMenuDivider(),
+        if (isOnItem)
+          const PopupMenuItem(value: 'props', child: Text('Properties')),
+      ],
+    );
+
+    switch (result) {
+      case 'open':
+        if (single != null) await _openLocal(single);
+        break;
+      case 'upload':
+        await _copyLocalSelectionToRemote();
+        break;
+      case 'newFolder':
+        await _localMkdir();
+        break;
+      case 'rename':
+        if (single != null) await _localRename(single);
+        break;
+      case 'delete':
+        await _localDeleteSelected();
+        break;
+      case 'refresh':
+        await _loadLocal();
+        break;
+      case 'selectAll':
+        setState(() {
+          _selLocal = {
+            for (int i = 0; i < _localFiles.length; i++)
+              if (!_localFiles[i].isUp) i,
+          };
+        });
+        break;
+      case 'clearSel':
+        setState(() => _selLocal.clear());
+        break;
+      case 'props':
+        if (single != null) await _showPropertiesLocal(single);
+        break;
+      default:
+        break;
+    }
+  }
+
+  Future<void> _showRemoteContextMenu({required Offset pos, int? index}) async {
+    final items = _getRemoteSelection(ensureIndex: index);
+    final single = items.length == 1 ? items.first : null;
+    final isOnItem =
+        index != null &&
+        index >= 0 &&
+        index < _remoteFiles.length &&
+        !_remoteFiles[index].isUp;
+
+    final result = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(pos.dx, pos.dy, pos.dx, pos.dy),
+      items: [
+        if (isOnItem && (single?.isDir ?? true))
+          const PopupMenuItem(value: 'open', child: Text('Open')),
+        if (isOnItem)
+          const PopupMenuItem(
+            value: 'download',
+            child: Text('Download to Local'),
+          ),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'newFolder', child: Text('New Folder')),
+        if (isOnItem && items.length == 1)
+          const PopupMenuItem(value: 'rename', child: Text('Rename')),
+        if (isOnItem)
+          const PopupMenuItem(value: 'delete', child: Text('Delete')),
+        const PopupMenuItem(value: 'refresh', child: Text('Refresh')),
+        const PopupMenuDivider(),
+        const PopupMenuItem(value: 'selectAll', child: Text('Select All')),
+        const PopupMenuItem(value: 'clearSel', child: Text('Clear Selection')),
+        if (isOnItem) const PopupMenuDivider(),
+        if (isOnItem)
+          const PopupMenuItem(value: 'props', child: Text('Properties')),
+      ],
+    );
+
+    switch (result) {
+      case 'open':
+        if (single != null) await _openRemote(single);
+        break;
+      case 'download':
+        await _copyRemoteSelectionToLocal();
+        break;
+      case 'newFolder':
+        await _remoteMkdir();
+        break;
+      case 'rename':
+        if (single != null) await _remoteRename(single);
+        break;
+      case 'delete':
+        await _remoteDeleteSelected();
+        break;
+      case 'refresh':
+        await _loadRemote();
+        break;
+      case 'selectAll':
+        setState(() {
+          _selRemote = {
+            for (int i = 0; i < _remoteFiles.length; i++)
+              if (!_remoteFiles[i].isUp) i,
+          };
+        });
+        break;
+      case 'clearSel':
+        setState(() => _selRemote.clear());
+        break;
+      case 'props':
+        if (single != null) await _showPropertiesRemote(single);
+        break;
+      default:
+        break;
+    }
+  }
+
   // ------------------- BUILD -------------------
   @override
   Widget build(BuildContext context) {
     final disabled = _busy || _sftp == null;
 
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        scaffoldBackgroundColor: Colors.white, // default background putih
-      ),
-      home: Scaffold(
-        body: Column(
-          children: [
-            Container(
-              color: Colors.white,
-              height: 30,
-              // color: Colors.grey[200],
-              child: Row(
-                children: [
-                  _buildMenuButton('Window'),
-                  _buildMenuButton('Local'),
-                  _buildMenuButton('Remote'),
-                  _buildMenuButton('Upload queue'),
-                  _buildMenuButton('Download queue'),
-                  _buildMenuButton('Log'),
-                ],
-              ),
-            ),
-
-            Container(
-              height: 50,
-              color: Colors.grey[100],
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Row(
-                children: [
-                  _buildToolbarButton(
-                    icon: Icons.folder_open,
-                    tooltip: 'Browse',
-                    onPressed: disabled ? null : () {},
-                  ),
-                  _buildToolbarButton(
-                    icon: Icons.upload,
-                    tooltip: 'Upload queue',
-                    onPressed: disabled
-                        ? null
-                        : () async {
-                            final x = await fs.openFile();
-                            if (x != null) {
-                              await _uploadFile(
-                                File(x.path),
-                                p.basename(x.path),
-                              );
-                            }
-                          },
-                  ),
-                  _buildToolbarButton(
-                    icon: Icons.download,
-                    tooltip: 'Download queue',
-                    onPressed: disabled
-                        ? null
-                        : () async {
-                            final idx = _selectedRemote;
-                            if (idx == null) return;
-                            final it = _remoteFiles[idx];
-                            if (!it.isUp && !it.isDir) {
-                              final to = File(p.join(_localPath, it.name));
-                              await _downloadFile(it.path, to);
-                            }
-                          },
-                  ),
-                  _buildToolbarButton(
-                    icon: Icons.list_alt,
-                    tooltip: 'Log',
-                    onPressed: disabled ? null : () {},
-                  ),
-                  const SizedBox(width: 16),
-                  _buildToolbarButton(
-                    icon: Icons.refresh,
-                    tooltip: 'Refresh',
-                    onPressed: disabled
-                        ? null
-                        : () async {
-                            await Future.wait([_loadLocal(), _loadRemote()]);
-                            _setStatus('Refreshed');
-                          },
-                  ),
-                  _buildToolbarButton(
-                    icon: Icons.arrow_forward,
-                    tooltip: 'Copy Local → Remote',
-                    onPressed: disabled ? null : _copyLocalSelectionToRemote,
-                  ),
-                  _buildToolbarButton(
-                    icon: Icons.arrow_back,
-                    tooltip: 'Copy Remote → Local',
-                    onPressed: disabled ? null : _copyRemoteSelectionToLocal,
-                  ),
-                  const Spacer(),
-                  if (_busy) ...[
-                    const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                    if (_progress != null) ...[
-                      const SizedBox(width: 10),
-                      SizedBox(
-                        width: 200,
-                        child: LinearProgressIndicator(value: _progress),
-                      ),
-                    ],
-                  ],
-                  if (_status != null)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 8),
-                      child: Text(
-                        _status!,
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Colors.black54,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-
-            if (_bannerError != null)
-              Container(
-                color: Colors.red[100],
-                padding: const EdgeInsets.all(8),
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  _bannerError!,
-                  style: const TextStyle(color: Colors.red),
+    return Scaffold(
+      backgroundColor: Colors.white,
+      body: Column(
+        children: [
+          Container(
+            height: 50,
+            color: Colors.grey[100],
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                _buildToolbarButton(
+                  icon: Icons.upload,
+                  tooltip: 'Upload file',
+                  onPressed: disabled
+                      ? null
+                      : () async {
+                          final x = await fs.openFile();
+                          if (x != null) {
+                            await _uploadFile(File(x.path), p.basename(x.path));
+                          }
+                        },
                 ),
-              ),
-
-            Expanded(
-              child: Row(
-                children: [
-                  // Local files panel
-                  Expanded(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey[300]!),
-                      ),
-                      child: Column(
-                        children: [
-                          Container(
-                            height: 35,
-                            color: Colors.grey[50],
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              children: [
-                                const Text(
-                                  'Local files',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                                const Spacer(),
-                                const Text(
-                                  'Filter:',
-                                  style: TextStyle(fontSize: 12),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 150,
-                                  height: 25,
-                                  child: TextField(
-                                    style: const TextStyle(fontSize: 12),
-                                    decoration: const InputDecoration(
-                                      border: OutlineInputBorder(),
-                                      contentPadding: EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 4,
-                                      ),
-                                      isDense: true,
-                                    ),
-                                    onChanged: (v) {
-                                      _localFilter = v;
-                                      _applyLocalFilter();
-                                    },
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          // Path navigation bar
-                          _pathBar(
-                            isRemote: false,
-                            ctrl: _localPathCtrl,
-                            onSubmit: _setLocalPath,
-                            onPick: () async {
-                              final dir = await fs.getDirectoryPath();
-                              if (dir != null) {
-                                _localPath = dir;
-                                await _loadLocal();
-                                _syncPathCtrls();
-                              }
-                            },
-                            onBack: () async {
-                              _localPath = p.normalize(
-                                p.join(_localPath, '..'),
-                              );
-                              await _loadLocal();
-                            },
-                            onHome: () async {
-                              _localPath = _defaultLocalHome();
-                              await _loadLocal();
-                            },
-                            onRefresh: _loadLocal,
-                            actions: [
-                              IconButton(
-                                tooltip: 'Select All',
-                                icon: const Icon(Icons.select_all, size: 16),
-                                onPressed: disabled
-                                    ? null
-                                    : () => setState(() {
-                                        _selLocal = {
-                                          for (
-                                            int i = 0;
-                                            i < _localFiles.length;
-                                            i++
-                                          )
-                                            if (!_localFiles[i].isUp) i,
-                                        };
-                                      }),
-                              ),
-                              IconButton(
-                                tooltip: 'Clear Selection',
-                                icon: const Icon(Icons.deselect, size: 16),
-                                onPressed: disabled
-                                    ? null
-                                    : () => setState(() => _selLocal.clear()),
-                              ),
-                              IconButton(
-                                tooltip: 'New folder',
-                                icon: const Icon(
-                                  Icons.create_new_folder,
-                                  size: 16,
-                                ),
-                                onPressed: disabled ? null : _localMkdir,
-                              ),
-                            ],
-                          ),
-                          // File list
-                          Expanded(
-                            child: _fileList(
-                              files: _localFiles,
-                              selectedIndex: _selectedLocal,
-                              selectedSet: _selLocal,
-                              onSelect: (i) => _selectLocal(i),
-                              onDoubleTap: (f) => _doubleClickLocal(f),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
+                _buildToolbarButton(
+                  icon: Icons.download,
+                  tooltip: 'Download file',
+                  onPressed: disabled
+                      ? null
+                      : () async {
+                          final idx = _selectedRemote;
+                          if (idx == null) return;
+                          final it = _remoteFiles[idx];
+                          if (!it.isUp && !it.isDir) {
+                            final to = File(p.join(_localPath, it.name));
+                            await _downloadFile(it.path, to);
+                          }
+                        },
+                ),
+                const SizedBox(width: 16),
+                _buildToolbarButton(
+                  icon: Icons.refresh,
+                  tooltip: 'Refresh',
+                  onPressed: disabled
+                      ? null
+                      : () async {
+                          await Future.wait([_loadLocal(), _loadRemote()]);
+                          _setStatus('Refreshed');
+                        },
+                ),
+                _buildToolbarButton(
+                  icon: Icons.arrow_forward,
+                  tooltip: 'Copy Local → Remote',
+                  onPressed: disabled ? null : _copyLocalSelectionToRemote,
+                ),
+                _buildToolbarButton(
+                  icon: Icons.arrow_back,
+                  tooltip: 'Copy Remote → Local',
+                  onPressed: disabled ? null : _copyRemoteSelectionToLocal,
+                ),
+                const Spacer(),
+                if (_busy) ...[
+                  const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
                   ),
-
-                  // Vertical divider
-                  Container(width: 1, color: Colors.grey[400]),
-
-                  // Remote files panel
-                  Expanded(
-                    child: Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey[300]!),
-                      ),
-                      child: Column(
-                        children: [
-                          Container(
-                            height: 35,
-                            color: Colors.green[50],
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Row(
-                              children: [
-                                const Text(
-                                  'Remote files',
-                                  style: TextStyle(
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.bold,
-                                    color: Colors.green,
-                                  ),
-                                ),
-                                const Spacer(),
-                                const Text(
-                                  'Filter:',
-                                  style: TextStyle(fontSize: 12),
-                                ),
-                                const SizedBox(width: 8),
-                                SizedBox(
-                                  width: 150,
-                                  height: 25,
-                                  child: TextField(
-                                    style: const TextStyle(fontSize: 12),
-                                    decoration: const InputDecoration(
-                                      border: OutlineInputBorder(),
-                                      contentPadding: EdgeInsets.symmetric(
-                                        horizontal: 8,
-                                        vertical: 4,
-                                      ),
-                                      isDense: true,
-                                    ),
-                                    onChanged: (v) {
-                                      _remoteFilter = v;
-                                      _applyRemoteFilter();
-                                    },
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          // Path navigation bar
-                          _pathBar(
-                            isRemote: true,
-                            ctrl: _remotePathCtrl,
-                            onSubmit: _setRemotePath,
-                            onBack: () async {
-                              _remotePath = p.posix.normalize(
-                                p.posix.join(_remotePath, '..'),
-                              );
-                              await _loadRemote();
-                            },
-                            onHome: () async {
-                              try {
-                                final home = (await _sshRun(
-                                  _ssh!,
-                                  r'printf %s "$HOME"',
-                                )).trim();
-                                _remotePath = home.isEmpty
-                                    ? '/'
-                                    : p.posix.normalize(home);
-                              } catch (_) {
-                                _remotePath = '/';
-                              }
-                              await _loadRemote();
-                            },
-                            onRefresh: _loadRemote,
-                            actions: [
-                              IconButton(
-                                tooltip: 'Select All',
-                                icon: const Icon(Icons.select_all, size: 16),
-                                onPressed: disabled
-                                    ? null
-                                    : () => setState(() {
-                                        _selRemote = {
-                                          for (
-                                            int i = 0;
-                                            i < _remoteFiles.length;
-                                            i++
-                                          )
-                                            if (!_remoteFiles[i].isUp) i,
-                                        };
-                                      }),
-                              ),
-                              IconButton(
-                                tooltip: 'Clear Selection',
-                                icon: const Icon(Icons.deselect, size: 16),
-                                onPressed: disabled
-                                    ? null
-                                    : () => setState(() => _selRemote.clear()),
-                              ),
-                              IconButton(
-                                tooltip: 'New folder',
-                                icon: const Icon(
-                                  Icons.create_new_folder,
-                                  size: 16,
-                                ),
-                                onPressed: disabled ? null : _remoteMkdir,
-                              ),
-                            ],
-                          ),
-                          // File list
-                          Expanded(
-                            child: _fileList(
-                              files: _remoteFiles,
-                              selectedIndex: _selectedRemote,
-                              selectedSet: _selRemote,
-                              onSelect: (i) => _selectRemote(i),
-                              onDoubleTap: (f) => _doubleClickRemote(f),
-                            ),
-                          ),
-                        ],
-                      ),
+                  if (_progress != null) ...[
+                    const SizedBox(width: 10),
+                    SizedBox(
+                      width: 200,
+                      child: LinearProgressIndicator(value: _progress),
                     ),
-                  ),
+                  ],
                 ],
-              ),
+                if (_status != null)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Text(
+                      _status!,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Colors.black54,
+                      ),
+                    ),
+                  ),
+              ],
             ),
+          ),
 
+          if (_bannerError != null)
             Container(
-              height: 25,
-              color: Colors.grey[200],
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              child: Row(
-                children: [
-                  if (_status != null)
-                    Text(_status!, style: const TextStyle(fontSize: 11)),
-                  const Spacer(),
-                  Text(
-                    'Local: ${_localFiles.length - (_localFiles.isNotEmpty && _localFiles.first.isUp ? 1 : 0)} items',
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                  const SizedBox(width: 16),
-                  Text(
-                    'Remote: ${_remoteFiles.length - (_remoteFiles.isNotEmpty && _remoteFiles.first.isUp ? 1 : 0)} items',
-                    style: const TextStyle(fontSize: 11),
-                  ),
-                ],
+              color: Colors.red[100],
+              padding: const EdgeInsets.all(8),
+              alignment: Alignment.centerLeft,
+              child: Text(
+                _bannerError!,
+                style: const TextStyle(color: Colors.red),
               ),
             ),
-          ],
-        ),
-      ),
-    );
-  }
 
-  Widget _buildMenuButton(String text) {
-    return InkWell(
-      onTap: () {
-        // Menu functionality can be implemented here
-      },
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        child: Text(text, style: const TextStyle(fontSize: 12)),
+          Expanded(
+            child: Row(
+              children: [
+                // Local panel
+                Expanded(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey[300]!),
+                    ),
+                    child: Column(
+                      children: [
+                        Container(
+                          height: 35,
+                          color: Colors.grey[50],
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Row(
+                            children: [
+                              const Text(
+                                'Local files',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const Spacer(),
+                              const Text(
+                                'Filter:',
+                                style: TextStyle(fontSize: 12),
+                              ),
+                              const SizedBox(width: 8),
+                              SizedBox(
+                                width: 150,
+                                height: 25,
+                                child: TextField(
+                                  style: const TextStyle(fontSize: 12),
+                                  decoration: const InputDecoration(
+                                    border: OutlineInputBorder(),
+                                    contentPadding: EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    isDense: true,
+                                  ),
+                                  onChanged: (v) {
+                                    _localFilter = v;
+                                    _applyLocalFilter();
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        _pathBar(
+                          isRemote: false,
+                          ctrl: _localPathCtrl,
+                          onSubmit: _setLocalPath,
+                          onPick: () async {
+                            final dir = await fs.getDirectoryPath();
+                            if (dir != null) {
+                              _localPath = dir;
+                              await _loadLocal();
+                              _syncPathCtrls();
+                            }
+                          },
+                          onBack: () async {
+                            _localPath = p.normalize(p.join(_localPath, '..'));
+                            await _loadLocal();
+                          },
+                          onHome: () async {
+                            _localPath = _defaultLocalHome();
+                            await _loadLocal();
+                          },
+                          onRefresh: _loadLocal,
+                          actions: [
+                            IconButton(
+                              tooltip: 'Select All',
+                              icon: const Icon(Icons.select_all, size: 16),
+                              onPressed: () => setState(() {
+                                _selLocal = {
+                                  for (int i = 0; i < _localFiles.length; i++)
+                                    if (!_localFiles[i].isUp) i,
+                                };
+                              }),
+                            ),
+                            IconButton(
+                              tooltip: 'Clear Selection',
+                              icon: const Icon(Icons.deselect, size: 16),
+                              onPressed: () =>
+                                  setState(() => _selLocal.clear()),
+                            ),
+                            IconButton(
+                              tooltip: 'New folder',
+                              icon: const Icon(
+                                Icons.create_new_folder,
+                                size: 16,
+                              ),
+                              onPressed: _localMkdir,
+                            ),
+                          ],
+                        ),
+                        Expanded(
+                          child: _fileList(
+                            files: _localFiles,
+                            selectedIndex: _selectedLocal,
+                            selectedSet: _selLocal,
+                            onSelect: (i) => _selectLocal(i),
+                            onDoubleTap: (f) => _doubleClickLocal(f),
+                            onItemContextMenu: (i, pos) {
+                              _forceSelect(isRemote: false, index: i);
+                              _showLocalContextMenu(pos: pos, index: i);
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                Container(width: 1, color: Colors.grey[400]),
+
+                // Remote panel
+                Expanded(
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey[300]!),
+                    ),
+                    child: Column(
+                      children: [
+                        Container(
+                          height: 35,
+                          color: Colors.green[50],
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Row(
+                            children: [
+                              const Text(
+                                'Remote files',
+                                style: TextStyle(
+                                  fontSize: 14,
+                                  fontWeight: FontWeight.bold,
+                                  color: Colors.green,
+                                ),
+                              ),
+                              const Spacer(),
+                              const Text(
+                                'Filter:',
+                                style: TextStyle(fontSize: 12),
+                              ),
+                              const SizedBox(width: 8),
+                              SizedBox(
+                                width: 150,
+                                height: 25,
+                                child: TextField(
+                                  style: const TextStyle(fontSize: 12),
+                                  decoration: const InputDecoration(
+                                    border: OutlineInputBorder(),
+                                    contentPadding: EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                      vertical: 4,
+                                    ),
+                                    isDense: true,
+                                  ),
+                                  onChanged: (v) {
+                                    _remoteFilter = v;
+                                    _applyRemoteFilter();
+                                  },
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        _pathBar(
+                          isRemote: true,
+                          ctrl: _remotePathCtrl,
+                          onSubmit: _setRemotePath,
+                          onBack: () async {
+                            _remotePath = p.posix.normalize(
+                              p.posix.join(_remotePath, '..'),
+                            );
+                            await _loadRemote();
+                          },
+                          onHome: () async {
+                            try {
+                              final home = (await _sshRun(
+                                _ssh!,
+                                r'printf %s "$HOME"',
+                              )).trim();
+                              _remotePath = home.isEmpty
+                                  ? '/'
+                                  : p.posix.normalize(home);
+                            } catch (_) {
+                              _remotePath = '/';
+                            }
+                            await _loadRemote();
+                          },
+                          onRefresh: _loadRemote,
+                          actions: [
+                            IconButton(
+                              tooltip: 'Select All',
+                              icon: const Icon(Icons.select_all, size: 16),
+                              onPressed: () => setState(() {
+                                _selRemote = {
+                                  for (int i = 0; i < _remoteFiles.length; i++)
+                                    if (!_remoteFiles[i].isUp) i,
+                                };
+                              }),
+                            ),
+                            IconButton(
+                              tooltip: 'Clear Selection',
+                              icon: const Icon(Icons.deselect, size: 16),
+                              onPressed: () =>
+                                  setState(() => _selRemote.clear()),
+                            ),
+                            IconButton(
+                              tooltip: 'New folder',
+                              icon: const Icon(
+                                Icons.create_new_folder,
+                                size: 16,
+                              ),
+                              onPressed: _remoteMkdir,
+                            ),
+                          ],
+                        ),
+                        Expanded(
+                          child: _fileList(
+                            files: _remoteFiles,
+                            selectedIndex: _selectedRemote,
+                            selectedSet: _selRemote,
+                            onSelect: (i) => _selectRemote(i),
+                            onDoubleTap: (f) => _doubleClickRemote(f),
+                            onItemContextMenu: (i, pos) {
+                              _forceSelect(isRemote: true, index: i);
+                              _showRemoteContextMenu(pos: pos, index: i);
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+          // Status bar
+          Container(
+            height: 25,
+            color: Colors.grey[200],
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            child: Row(
+              children: [
+                if (_status != null)
+                  Text(_status!, style: const TextStyle(fontSize: 11)),
+                const Spacer(),
+                Text(
+                  'Local: ${_localFiles.length - (_localFiles.isNotEmpty && _localFiles.first.isUp ? 1 : 0)} items',
+                  style: const TextStyle(fontSize: 11),
+                ),
+                const SizedBox(width: 16),
+                Text(
+                  'Remote: ${_remoteFiles.length - (_remoteFiles.isNotEmpty && _remoteFiles.first.isUp ? 1 : 0)} items',
+                  style: const TextStyle(fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1182,7 +1589,7 @@ class _SftpWindowState extends State<SftpWindow> {
             onPressed: () => onHome(),
             constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
           ),
-          if (onPick != null)
+          if (onPick != null && !isRemote)
             IconButton(
               icon: const Icon(Icons.folder_open, size: 16),
               onPressed: () => onPick(),
@@ -1220,6 +1627,7 @@ class _SftpWindowState extends State<SftpWindow> {
     required Set<int> selectedSet,
     required void Function(int) onSelect,
     required void Function(_FileItem) onDoubleTap,
+    required void Function(int index, Offset globalPos) onItemContextMenu,
   }) {
     return Column(
       children: [
@@ -1261,8 +1669,6 @@ class _SftpWindowState extends State<SftpWindow> {
             ],
           ),
         ),
-
-        // File list
         Expanded(
           child: ListView.builder(
             itemCount: files.length,
@@ -1271,59 +1677,82 @@ class _SftpWindowState extends State<SftpWindow> {
               final selected = selectedSet.contains(i);
               final isCurrent = selectedIndex == i;
 
-              return InkWell(
-                onTap: () => onSelect(i),
-                onDoubleTap: () => onDoubleTap(f),
-                child: Container(
-                  height: 22,
-                  color: selected
-                      ? Colors.blue.withOpacity(0.15)
-                      : (isCurrent
-                            ? Colors.blue.withOpacity(0.08)
-                            : (i % 2 == 0 ? Colors.grey[50] : Colors.white)),
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  child: Row(
-                    children: [
-                      Icon(
-                        f.isUp
-                            ? Icons.arrow_upward
-                            : (f.isDir
-                                  ? Icons.folder
-                                  : Icons.insert_drive_file),
-                        size: 14,
-                        color: f.isDir ? Colors.orange[600] : Colors.grey[600],
+              return Listener(
+                behavior: HitTestBehavior.opaque,
+                onPointerDown: (e) {
+                  if (e.kind == PointerDeviceKind.mouse &&
+                      (e.buttons & kSecondaryMouseButton) != 0) {
+                    onItemContextMenu(
+                      i,
+                      e.position,
+                    ); // parent akan _forceSelect
+                  }
+                },
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onSecondaryTapDown: (d) =>
+                      onItemContextMenu(i, d.globalPosition),
+                  onSecondaryTapUp: (d) =>
+                      onItemContextMenu(i, d.globalPosition),
+                  child: InkWell(
+                    onTap: () => onSelect(i),
+                    onDoubleTap: () => onDoubleTap(f),
+                    child: Container(
+                      height: 22,
+                      color: selected
+                          ? Colors.blue.withOpacity(0.15)
+                          : (isCurrent
+                                ? Colors.blue.withOpacity(0.08)
+                                : (i % 2 == 0
+                                      ? Colors.grey[50]
+                                      : Colors.white)),
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Row(
+                        children: [
+                          Icon(
+                            f.isUp
+                                ? Icons.arrow_upward
+                                : (f.isDir
+                                      ? Icons.folder
+                                      : Icons.insert_drive_file),
+                            size: 14,
+                            color: f.isDir
+                                ? Colors.orange[600]
+                                : Colors.grey[600],
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            flex: 3,
+                            child: Text(
+                              f.name,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                          ),
+                          Expanded(
+                            flex: 1,
+                            child: Text(
+                              f.isDir ? '' : _fmtSize(f.size),
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                          ),
+                          Expanded(
+                            flex: 1,
+                            child: Text(
+                              f.isDir ? 'File folder' : 'File',
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                          ),
+                          Expanded(
+                            flex: 1,
+                            child: Text(
+                              f.modified == null ? '' : _fmtTime(f.modified!),
+                              style: const TextStyle(fontSize: 11),
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(width: 6),
-                      Expanded(
-                        flex: 3,
-                        child: Text(
-                          f.name,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.isDir ? '' : _fmtSize(f.size),
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.isDir ? 'File folder' : 'File',
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ),
-                      Expanded(
-                        flex: 1,
-                        child: Text(
-                          f.modified == null ? '' : _fmtTime(f.modified!),
-                          style: const TextStyle(fontSize: 11),
-                        ),
-                      ),
-                    ],
+                    ),
                   ),
                 ),
               );
